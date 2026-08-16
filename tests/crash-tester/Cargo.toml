@@ -1,0 +1,17 @@
+[package]
+name = "slimdb-crash-tester"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kill -9 crash test harness for SlimDB (writer + runner binaries)."
+
+[dependencies]
+slimdb-core = { path = "../../core" }
+
+[[bin]]
+name = "slimdb-writer"
+path = "src/bin/writer.rs"
+
+[[bin]]
+name = "slimdb-runner"
+path = "src/bin/runner.rs"

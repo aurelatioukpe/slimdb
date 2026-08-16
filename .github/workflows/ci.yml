@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit + integration tests
+        run: cargo test --workspace
+
+      # The signature crash-recovery test: random torn writes, recovery must
+      # match a shadow prefix (spec §10).
+      - name: Torn-write fuzz (release)
+        run: |
+          cargo test -p slimdb-core --release --test fuzz_torn
+
+      # The kill -9 loop (spec §10 / §12): spawn writers, SIGKILL at random
+      # points, reopen, verify state. Bump --iterations for release gates.
+      - name: Kill -9 crash loop
+        run: |
+          cargo build -p slimdb-crash-tester --release
+          ./target/release/slimdb-runner /tmp/slimdb-crash-ci 200 1500

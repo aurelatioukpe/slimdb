@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.sdb
+*.sdb-wal
+*.sdb.tmp
+Cargo.lock.orig

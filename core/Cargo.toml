@@ -1,0 +1,8 @@
+[package]
+name = "slimdb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SlimDB engine: the tiny embedded document database for local apps."
+
+[dependencies]

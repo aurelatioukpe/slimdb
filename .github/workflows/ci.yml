@@ -38,3 +38,34 @@ jobs:
         run: |
           cargo build -p slimdb-crash-tester --release
           ./target/release/slimdb-runner /tmp/slimdb-crash-ci 200 1500
+
+      # C ABI: Rust tests + the real C example compiled against the staticlib.
+      - name: C ABI tests and example
+        run: |
+          cargo test -p slimdb-c
+          make -C bindings/c test
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Python dev headers
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+      - name: Build the PyO3 binding via pip
+        working-directory: bindings/python
+        run: |
+          pip install .
+          python -m unittest discover -s tests -v
+          python examples/demo.py
+          python -c '
+import tempfile, os, subprocess, sys, time
+import slimdb
+path = os.path.join(tempfile.mkdtemp(), "g.sdb")
+code = "import sys, slimdb; db = slimdb.open(sys.argv[1]); i=0\nwhile True:\n db.set(\"k\", i); i += 1\n"
+p = subprocess.Popen([sys.executable, "-c", code, path])
+time.sleep(0.1); p.kill(); p.wait()
+db = slimdb.open(path)
+assert db.get("k") is not None
+print("kill -9 via Python: ok")
+'

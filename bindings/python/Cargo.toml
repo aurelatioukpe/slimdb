@@ -1,0 +1,14 @@
+[package]
+name = "slimdb-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SlimDB Python binding (PyO3) — sits on the slimdb_* C ABI."
+
+[lib]
+name = "_slimdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
+slimdb-c = { path = "../c" }

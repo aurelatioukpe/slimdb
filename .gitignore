@@ -4,3 +4,15 @@
 *.sdb-wal
 *.sdb.tmp
 Cargo.lock.orig
+
+# Python binding build artifacts
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+bindings/python/_slimdb*.so
+bindings/c/examples/demo
+bindings/c/demo.sdb
+bindings/c/demo-backup.sdb
+bindings/c/demo.sdb-wal

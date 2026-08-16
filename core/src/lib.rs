@@ -22,6 +22,7 @@ pub mod path;
 pub mod crc32;
 pub mod document;
 pub mod error;
+pub mod json;
 pub mod record;
 pub mod recovery;
 pub mod wal;
@@ -119,7 +120,7 @@ impl Db {
         if let Some(bytes) = &snapshot_bytes {
             let header = parse_db_header(bytes)?;
             db_id = header.db_id;
-            let outcome = replay(bytes, DB_HEADER_LEN, false, true, |rec| {
+            let outcome = replay(bytes, DB_HEADER_LEN, 0, false, true, |rec| {
                 apply_record_to_state(&mut state, rec)
             })?;
             max_seq = max_seq.max(outcome.max_seq);
@@ -134,9 +135,13 @@ impl Db {
                     })?;
                     match parse_wal_header(&wb) {
                         Some(id) if id == header.db_id => {
-                            let outcome = replay(&wb, WAL_HEADER_LEN, true, false, |rec| {
-                                apply_record_to_state(&mut state, rec)
-                            })?;
+                            // Records already covered by the snapshot (seq
+                            // <= last_seq) are skipped: re-applying them on
+                            // a state that has since advanced would fail.
+                            let outcome =
+                                replay(&wb, WAL_HEADER_LEN, header.last_seq, true, false, |rec| {
+                                    apply_record_to_state(&mut state, rec)
+                                })?;
                             max_seq = max_seq.max(outcome.max_seq);
                             (header.db_id, Some(outcome.truncate_to as u64), false)
                         }
@@ -157,7 +162,7 @@ impl Db {
                         // only a WAL; replay it.
                         Some(id) => {
                             db_id = id;
-                            let outcome = replay(&wb, WAL_HEADER_LEN, true, false, |rec| {
+                            let outcome = replay(&wb, WAL_HEADER_LEN, 0, true, false, |rec| {
                                 apply_record_to_state(&mut state, rec)
                             })?;
                             max_seq = max_seq.max(outcome.max_seq);
@@ -306,11 +311,17 @@ impl Db {
         // Every buffered WAL byte must be durable before the snapshot is
         // written, otherwise truncating the WAL could lose writes.
         self.wal.flush(true)?;
+        // The snapshot covers the whole WAL history up to the last issued
+        // sequence. It is recorded in the header so that, if a crash lands
+        // between the snapshot rename and the WAL reset, recovery skips the
+        // WAL records already contained in the snapshot instead of
+        // re-applying them to a state that has since advanced.
+        let last_seq = self.seq.saturating_sub(1);
         let tmp = temp_path_for(&self.path);
         {
             let mut out = File::create(&tmp)
                 .map_err(|e| SlimDbError::Io(format!("create {}: {e}", tmp.display())))?;
-            write_db_header(&mut out, self.db_id)?;
+            write_db_header(&mut out, self.db_id, last_seq)?;
             for (key, value) in &self.state {
                 let rec = Record::set(key, value, self.seq)?;
                 self.seq += 1;
@@ -340,7 +351,8 @@ impl Db {
         {
             let mut out = File::create(&tmp)
                 .map_err(|e| SlimDbError::Io(format!("create {}: {e}", tmp.display())))?;
-            write_db_header(&mut out, self.db_id)?;
+            let last_seq = self.seq.saturating_sub(1);
+            write_db_header(&mut out, self.db_id, last_seq)?;
             for (key, value) in &self.state {
                 let rec = Record::set(key, value, self.seq)?;
                 self.seq += 1;
@@ -367,7 +379,7 @@ impl Db {
         let header = parse_db_header(&bytes)?;
         let mut state = BTreeMap::new();
         let mut max_seq = 0u64;
-        let outcome = replay(&bytes, DB_HEADER_LEN, false, true, |rec| {
+        let outcome = replay(&bytes, DB_HEADER_LEN, 0, false, true, |rec| {
             apply_record_to_state(&mut state, rec)
         })?;
         max_seq = max_seq.max(outcome.max_seq);

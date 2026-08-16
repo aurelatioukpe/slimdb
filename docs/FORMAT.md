@@ -27,7 +27,7 @@ detected and discarded.
 | 0 | 8 | Magic: `"SLIMDB\0\0"` |
 | 8 | 4 | Format version (`1`) |
 | 12 | 8 | Database id (random per database) |
-| 20 | 8 | Reserved (zero) |
+| 20 | 8 | `last_seq`: highest WAL sequence contained in this snapshot (`0` for a fresh database) |
 | 28 | 4 | CRC-32 of bytes `[0, 28)` |
 
 ## WAL header (20 bytes)
@@ -109,9 +109,15 @@ On open:
 
 WAL replay rules:
 
-* Records are applied in order. SET/DELETE/CLEAR outside a transaction apply
-  immediately; inside `TXN_BEGIN … TXN_COMMIT` they apply atomically at the
-  COMMIT.
+* Records with `seq <= last_seq` (the snapshot header's field) are **skipped**:
+  the snapshot already contains them. Re-applying them would be incorrect —
+  the snapshot state may have advanced past the point where an older record
+  was valid (e.g. `k10.x` was set before `k10` became a scalar; replaying it
+  on top of the snapshot would be a type mismatch). `last_seq` pins the exact
+  prefix of the WAL history the snapshot represents.
+* Remaining records are applied in order. SET/DELETE/CLEAR outside a
+  transaction apply immediately; inside `TXN_BEGIN … TXN_COMMIT` they apply
+  atomically at the COMMIT.
 * A transaction at the end of the log without a COMMIT is uncommitted: its
   records are discarded and the WAL is truncated before the BEGIN.
 * The first unparseable record is classified as either a **torn tail** or
@@ -123,17 +129,19 @@ WAL replay rules:
   * If valid records exist after it, the file is corrupted — open fails with
     a clear `Corrupt` error.
 
-Replay is idempotent: applying a WAL on top of a snapshot that already
-contains those records yields the same state, which is why compaction may
-crash at any point between the atomic snapshot rename and the WAL reset.
+The `last_seq` skip rule is what makes a crash between the atomic snapshot
+rename and the WAL reset safe: the snapshot rename succeeds, then the crash
+leaves the full WAL in place. On the next open, every WAL record is `<=`
+`last_seq` and is skipped — the snapshot alone is the recovered state, so
+recovery is idempotent.
 
 ## Compaction
 
 `compact` performs, in order:
 
 1. Flush + fsync the WAL (every buffered write becomes durable).
-2. Write a fresh snapshot to `game.sdb.tmp` (header + one SET record per
-   top-level key), fsync.
+2. Write a fresh snapshot to `game.sdb.tmp` (header with `last_seq` = the
+   last issued WAL sequence, then one SET record per top-level key), fsync.
 3. Atomically rename `game.sdb.tmp` → `game.sdb`, then fsync the directory.
 4. Reset the WAL to header-only and fsync.
 

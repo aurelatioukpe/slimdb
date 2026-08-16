@@ -1,7 +1,7 @@
 mod common;
 
 use common::TestDir;
-use slimdb_core::record::{write_wal_header, Record};
+use slimdb_core::record::{write_db_header, write_wal_header, Record};
 use slimdb_core::{Db, SlimDbError, Value};
 
 /// Build a WAL file at `wal_path` containing the given records.
@@ -201,6 +201,54 @@ fn rolled_back_txn_in_wal_is_discarded() {
     let db = Db::open(&path).unwrap();
     assert_eq!(db.get("x").unwrap(), None);
     assert_eq!(db.get("y").unwrap(), Some(Value::Int(1)));
+}
+
+/// The compaction crash window: the snapshot rename completed but the WAL
+/// reset did not. The WAL still holds every record up to the snapshot's
+/// `last_seq`; reopening must skip them — re-applying them would fail
+/// (e.g. `k10.x` was set before `k10` became a scalar, so replaying it on
+/// top of the snapshot, where `k10` is already scalar, is a TypeMismatch).
+#[test]
+fn crash_window_between_rename_and_wal_reset_is_safe() {
+    let dir = TestDir::new("rec-crash-window");
+    let path = dir.db("t.sdb");
+    let wal_path = dir.path.join("t.sdb-wal");
+    let db_id = 0x5EED_0001;
+
+    // Snapshot by hand: header with last_seq = 2 (WAL records up to seq 2
+    // are covered), plus one SET record with a fresh snapshot sequence.
+    let mut snap = Vec::new();
+    write_db_header(&mut snap, db_id, 2).unwrap();
+    Record::set("k10", &Value::Int(7), 3)
+        .unwrap()
+        .encode(&mut snap)
+        .unwrap();
+    std::fs::write(&path, &snap).unwrap();
+
+    // The old WAL, in *historical* order: k10 was an object (k10.x = 1),
+    // then became a scalar. Replaying set("k10.x") onto the snapshot state
+    // would be a type mismatch.
+    let records = [
+        Record::set("k10.x", &Value::Int(1), 1).unwrap(),
+        Record::set("k10", &Value::Int(7), 2).unwrap(),
+    ];
+    write_wal(&wal_path, db_id, &records);
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.get("k10").unwrap(), Some(Value::Int(7)));
+    assert_eq!(db.get("k10.x").unwrap(), None);
+
+    // Every WAL record was covered by the snapshot: the WAL is truncated to
+    // header-only.
+    let after = std::fs::read(&wal_path).unwrap();
+    assert_eq!(after.len(), 20);
+
+    // And the recovered database accepts new writes and persists them.
+    let mut db = db;
+    db.set("post", Value::Int(1)).unwrap();
+    db.close().unwrap();
+    let db2 = Db::open(&path).unwrap();
+    assert_eq!(db2.get("post").unwrap(), Some(Value::Int(1)));
 }
 
 #[test]

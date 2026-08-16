@@ -1,0 +1,63 @@
+name: crash-nightly
+
+# The heavy crash-test loop (spec §10, §12). Runs nightly with a much larger
+# batch than the per-push gate.
+#
+# Cost model (measured on a desktop build, max-ops=1000): ~0.2 s per
+# iteration, dominated by the random kill delay and per-op fsyncs.
+#   1 000 000 iterations ≈ 44 h single-threaded → parallelism is required.
+# This job runs WORKERS runners in parallel; the default totals 200 000
+# SIGKILLs per night in ~2-3 h. The count is configurable via dispatch input
+# (e.g. 1 000 000 needs 16 workers × 62 500, about 4-5 h on a 4-core runner).
+
+on:
+  schedule:
+    - cron: "17 2 * * *"   # 02:17 UTC, daily
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Total kill -9 iterations across workers"
+        required: false
+        default: "200000"
+      workers:
+        description: "Number of parallel runner processes"
+        required: false
+        default: "4"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build crash tester
+        run: cargo build -p slimdb-crash-tester --release
+
+      - name: Torn-write fuzz (extended)
+        run: |
+          cargo test -p slimdb-core --release --test fuzz_torn
+        env:
+          SLIMDB_FUZZ_ITERS: "5000"
+
+      - name: Kill -9 loop (large batch)
+        run: |
+          ITER="${{ github.event.inputs.iterations || '200000' }}"
+          WORKERS="${{ github.event.inputs.workers || '4' }}"
+          mkdir -p /tmp/slimdb-nightly
+          # Divide the total across parallel workers; a failure in any worker
+          # fails the job (each runner exits non-zero on divergence).
+          PER_WORKER=$(( ITER / WORKERS ))
+          pids=""
+          for w in $(seq 1 "$WORKERS"); do
+            ./target/release/slimdb-runner "/tmp/slimdb-nightly/w$w" "$PER_WORKER" 1000 &
+            pids="$pids $!"
+          done
+          failed=0
+          for p in $pids; do
+            if ! wait "$p"; then failed=1; fi
+          done
+          exit $failed

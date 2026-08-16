@@ -1,13 +1,14 @@
-//! A small, dependency-free JSON parser and printer used by the CLI to
-//! interchange values with scripts and humans.
+//! A small, dependency-free JSON parser and printer used for value
+//! interchange by the CLI, the C ABI and the bindings.
 //!
+//! JSON is an *API* model, never a storage format (see `docs/SPEC.md` §6).
 //! Supported: null, true, false, numbers, strings (with escapes and \uXXXX),
 //! arrays, objects. Binary values print as `"0x...."` hex strings; non-finite
 //! floats print as `null`.
 
 use std::collections::BTreeMap;
 
-use slimdb_core::Value;
+use crate::document::Value;
 
 /// Parse a JSON document into a [`Value`].
 pub fn parse(input: &str) -> Result<Value, String> {

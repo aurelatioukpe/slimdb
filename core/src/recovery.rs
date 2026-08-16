@@ -11,6 +11,12 @@
 //!
 //! Transactions are reconstructed by grouping records between `BEGIN` and
 //! `COMMIT` markers; an uncommitted transaction at the tail is discarded.
+//!
+//! Records with `seq <= skip_before_seq` are parsed (their sequence still
+//! counts toward `max_seq`) but not applied: they are already contained in
+//! the snapshot, whose header records the highest WAL sequence it covers
+//! (`DbHeader::last_seq`). Re-applying them would be incorrect — the state
+//! may have advanced past the point where an older record was valid.
 
 use crate::error::{Result, SlimDbError};
 use crate::record::{
@@ -39,6 +45,9 @@ pub struct ReplayOutcome {
 ///
 /// # Arguments
 ///
+/// * `skip_before_seq` — records with `seq <= skip_before_seq` are parsed
+///   but not applied: they are already contained in the snapshot (see
+///   `DbHeader::last_seq`). Pass `0` to apply everything.
 /// * `allow_tail_truncation` — if `false`, any invalid record is a hard
 ///   corruption error (used for the snapshot file, which is only ever written
 ///   atomically). If `true`, an invalid region with no valid record after it
@@ -48,6 +57,7 @@ pub struct ReplayOutcome {
 pub fn replay<F>(
     bytes: &[u8],
     start: usize,
+    skip_before_seq: u64,
     allow_tail_truncation: bool,
     forbid_txn: bool,
     mut apply: F,
@@ -91,8 +101,10 @@ where
                             SlimDbError::Corrupt("COMMIT without BEGIN".to_string())
                         })?;
                         for r in &batch {
-                            apply(r)?;
-                            applied += 1;
+                            if r.seq > skip_before_seq {
+                                apply(r)?;
+                                applied += 1;
+                            }
                         }
                         applied_end = end;
                     }
@@ -110,7 +122,7 @@ where
                     TYPE_SET | TYPE_DELETE | TYPE_CLEAR => {
                         if let Some(batch) = pending.as_mut() {
                             batch.push(rec);
-                        } else {
+                        } else if rec.seq > skip_before_seq {
                             apply(&rec)?;
                             applied += 1;
                             applied_end = end;
@@ -191,7 +203,7 @@ mod tests {
         ];
         let bytes = make_chain(&recs);
         let mut state = Vec::new();
-        let out = replay(&bytes, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
+        let out = replay(&bytes, 0, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
         assert_eq!(state, vec![1, 2]);
         assert_eq!(out.truncate_to, bytes.len());
         assert_eq!(out.max_seq, 2);
@@ -207,7 +219,7 @@ mod tests {
         ];
         let bytes = make_chain(&recs);
         let mut state = Vec::new();
-        let out = replay(&bytes, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
+        let out = replay(&bytes, 0, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
         assert_eq!(state, vec![2, 4]);
         assert_eq!(out.truncate_to, bytes.len());
     }
@@ -228,7 +240,7 @@ mod tests {
         ];
         let bytes = make_chain(&recs);
         let mut state = Vec::new();
-        let out = replay(&bytes, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
+        let out = replay(&bytes, 0, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
         assert_eq!(state, vec![1]);
         // Truncate at the end of the last applied record (before BEGIN).
         assert_eq!(out.truncate_to, encoded_len(&recs[0]));
@@ -244,7 +256,7 @@ mod tests {
         ];
         let bytes = make_chain(&recs);
         let mut state = Vec::new();
-        let out = replay(&bytes, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
+        let out = replay(&bytes, 0, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
         assert_eq!(state, vec![4]);
         assert_eq!(out.truncate_to, bytes.len());
     }
@@ -259,7 +271,7 @@ mod tests {
         // Chop off part of the last record.
         let torn = &bytes[..bytes.len() - 5];
         let mut state = Vec::new();
-        let out = replay(torn, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
+        let out = replay(torn, 0, 0, true, false, |r| apply_all(&mut state, r)).unwrap();
         assert_eq!(state, vec![1]);
         // Truncate at the end of the first (fully applied) record.
         assert_eq!(out.truncate_to, encoded_len(&recs[0]));
@@ -281,7 +293,7 @@ mod tests {
         spliced.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
         spliced.extend_from_slice(&bytes[first_len + second_len..]);
         let mut state = Vec::new();
-        let result = replay(&spliced, 0, true, false, |r| apply_all(&mut state, r));
+        let result = replay(&spliced, 0, 0, true, false, |r| apply_all(&mut state, r));
         assert!(result.is_err());
     }
 
@@ -289,7 +301,7 @@ mod tests {
     fn snapshot_forbids_txn() {
         let recs = vec![Record::txn_begin(1), Record::txn_commit(2)];
         let bytes = make_chain(&recs);
-        let result = replay(&bytes, 0, false, true, |_| Ok(()));
+        let result = replay(&bytes, 0, 0, false, true, |_| Ok(()));
         assert!(result.is_err());
     }
 
@@ -301,7 +313,42 @@ mod tests {
         ];
         let bytes = make_chain(&recs);
         let torn = &bytes[..bytes.len() - 1];
-        let result = replay(torn, 0, false, false, |_| Ok(()));
+        let result = replay(torn, 0, 0, false, false, |_| Ok(()));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn records_at_or_below_skip_seq_are_not_applied() {
+        // Simulates the compaction crash window: the snapshot already
+        // contains every record up to `last_seq`, and the WAL still holds
+        // them. They must be parsed (max_seq stays correct) but not
+        // re-applied, and the WAL truncates to the start.
+        let recs = vec![
+            Record::set("a", &crate::document::Value::Int(1), 1).unwrap(),
+            Record::set("b", &crate::document::Value::Int(2), 2).unwrap(),
+        ];
+        let bytes = make_chain(&recs);
+        let mut state = Vec::new();
+        let out = replay(&bytes, 0, 2, true, false, |r| apply_all(&mut state, r)).unwrap();
+        assert!(state.is_empty());
+        assert_eq!(out.truncate_to, 0);
+        assert_eq!(out.max_seq, 2);
+        assert_eq!(out.applied_records, 0);
+    }
+
+    #[test]
+    fn records_above_skip_seq_are_applied() {
+        // Records written after the snapshot boundary are not covered by it
+        // and must apply normally.
+        let recs = vec![
+            Record::set("a", &crate::document::Value::Int(1), 1).unwrap(),
+            Record::set("b", &crate::document::Value::Int(2), 2).unwrap(),
+            Record::set("c", &crate::document::Value::Int(3), 3).unwrap(),
+        ];
+        let bytes = make_chain(&recs);
+        let mut state = Vec::new();
+        let out = replay(&bytes, 0, 2, true, false, |r| apply_all(&mut state, r)).unwrap();
+        assert_eq!(state, vec![3]);
+        assert_eq!(out.truncate_to, bytes.len());
     }
 }

@@ -24,7 +24,7 @@ fn v1_snapshot_bytes(db_id: u64) -> Vec<u8> {
     out.extend_from_slice(&DB_MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&db_id.to_le_bytes());
-    out.extend_from_slice(&0u64.to_le_bytes()); // reserved
+    out.extend_from_slice(&0u64.to_le_bytes()); // last_seq: 0 (no WAL records covered)
     let header_crc = crc32(&out);
     out.extend_from_slice(&header_crc.to_le_bytes());
 

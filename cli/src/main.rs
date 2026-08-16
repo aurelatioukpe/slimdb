@@ -15,9 +15,9 @@
 //!
 //! Durability mode: `SLIMDB_DURABILITY=safe|balanced|fast` (default `safe`).
 
-mod json;
-
 use std::fmt;
+
+use slimdb_core::json;
 
 use slimdb_core::{Db, DurabilityMode, SlimDbError};
 

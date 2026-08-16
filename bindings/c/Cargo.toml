@@ -1,0 +1,13 @@
+[package]
+name = "slimdb-c"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SlimDB C ABI — the fundamental contract between the core and all bindings."
+
+[lib]
+name = "slimdb_c"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+slimdb-core = { path = "../../core" }

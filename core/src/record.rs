@@ -75,6 +75,11 @@ pub struct DbHeader {
     pub format_version: u32,
     /// Database identifier, unique per database file.
     pub db_id: u64,
+    /// Highest WAL sequence number included in this snapshot. On replay,
+    /// WAL records with a sequence <= this value are already contained in
+    /// the snapshot and are skipped (they may not be valid to re-apply on a
+    /// state that has since advanced). See docs/FORMAT.md §"Recovery".
+    pub last_seq: u64,
 }
 
 /// Result of attempting to parse a record at a position.
@@ -286,12 +291,12 @@ fn decode_payload(rtype: u8, seq: u64, payload: &[u8]) -> Result<Record> {
 }
 
 /// Write the database snapshot header to `out`.
-pub fn write_db_header(out: &mut impl Write, db_id: u64) -> Result<()> {
+pub fn write_db_header(out: &mut impl Write, db_id: u64, last_seq: u64) -> Result<()> {
     let mut buf = Vec::with_capacity(DB_HEADER_LEN);
     buf.extend_from_slice(&DB_MAGIC);
     buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     buf.extend_from_slice(&db_id.to_le_bytes());
-    buf.extend_from_slice(&0u64.to_le_bytes()); // reserved
+    buf.extend_from_slice(&last_seq.to_le_bytes());
     let crc = crc32(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
     debug_assert_eq!(buf.len(), DB_HEADER_LEN);
@@ -316,6 +321,7 @@ pub fn parse_db_header(bytes: &[u8]) -> Result<DbHeader> {
         return Err(SlimDbError::UnsupportedVersion(format_version));
     }
     let db_id = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+    let last_seq = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
     let stored = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
     let expected = crc32(&bytes[0..28]);
     if stored != expected {
@@ -326,6 +332,7 @@ pub fn parse_db_header(bytes: &[u8]) -> Result<DbHeader> {
     Ok(DbHeader {
         format_version,
         db_id,
+        last_seq,
     })
 }
 
@@ -452,16 +459,17 @@ mod tests {
     #[test]
     fn header_roundtrip() {
         let mut buf = Vec::new();
-        write_db_header(&mut buf, 0xDEAD_BEEF).unwrap();
+        write_db_header(&mut buf, 0xDEAD_BEEF, 42).unwrap();
         let header = parse_db_header(&buf).unwrap();
         assert_eq!(header.db_id, 0xDEAD_BEEF);
         assert_eq!(header.format_version, FORMAT_VERSION);
+        assert_eq!(header.last_seq, 42);
     }
 
     #[test]
     fn header_rejects_tampering() {
         let mut buf = Vec::new();
-        write_db_header(&mut buf, 1).unwrap();
+        write_db_header(&mut buf, 1, 0).unwrap();
         buf[0] ^= 0x01;
         assert!(matches!(
             parse_db_header(&buf),
@@ -469,7 +477,7 @@ mod tests {
         ));
 
         let mut buf = Vec::new();
-        write_db_header(&mut buf, 1).unwrap();
+        write_db_header(&mut buf, 1, 0).unwrap();
         // Change the version without fixing the checksum.
         buf[8..12].copy_from_slice(&2u32.to_le_bytes());
         assert!(matches!(

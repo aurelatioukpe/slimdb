@@ -14,7 +14,7 @@
 mod common;
 
 use common::{apply_deterministic_ops, Shadow, TestDir};
-use slimdb_core::{Db, DurabilityMode, Value};
+use slimdb_core::{Db, DurabilityMode, SlimDbError, Value};
 
 /// Number of fuzz iterations (override with SLIMDB_FUZZ_ITERS).
 fn iterations() -> usize {
@@ -94,10 +94,33 @@ fn torn_wal_never_loses_committed_prefix() {
             // Simulate a crash: drop without close.
         }
 
-        // 3. Simulate a torn write: truncate the WAL at a random byte.
-        //    Also occasionally overwrite the header entirely.
+        // 3. Simulate a crash. Most iterations truncate the WAL at a random
+        //    byte (torn tail). A few splice garbage into the *middle* of the
+        //    log: recovery must refuse to open, not silently truncate.
         if let Ok(wal_bytes) = std::fs::read(&wal_path) {
             let roll = (seed >> 16) % 20;
+            if roll == 1 {
+                // Mid-file corruption: only when there is enough valid data
+                // after the splice that the forward scan must find it.
+                let len = wal_bytes.len();
+                if len >= 20 + 64 + 500 {
+                    let p = 20 + (len - 20) / 2;
+                    let mut corrupted = wal_bytes;
+                    for b in corrupted.iter_mut().skip(p).take(64) {
+                        *b = 0xEE;
+                    }
+                    std::fs::write(&wal_path, &corrupted).unwrap();
+                    let opened = Db::open(&path);
+                    let is_corrupt = matches!(&opened, Err(SlimDbError::Corrupt(_)));
+                    drop(opened);
+                    assert!(
+                        is_corrupt,
+                        "iteration {it}: mid-file corruption must be a loud error, not a silent truncation"
+                    );
+                    let _ = std::fs::remove_dir_all(&dir.path);
+                    continue;
+                }
+            }
             let len = wal_bytes.len() as u64;
             let cut = if roll == 0 {
                 // Torn write inside the header: WAL becomes unusable.
